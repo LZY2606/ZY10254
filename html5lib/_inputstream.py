@@ -68,7 +68,25 @@ class BufferedStream(object):
         return pos
 
     def seek(self, pos):
-        assert pos <= self._bufferedBytes()
+        if pos > self._bufferedBytes():
+            # Seeking beyond what has been buffered so far is valid (e.g.
+            # skipping past a BOM that ended at a short-read boundary). Read
+            # forward, appending to the buffer, until enough bytes are
+            # available. The underlying stream may return fewer bytes than
+            # requested without being at EOF, so keep reading; b"" is the
+            # only signal for EOF.
+            while pos > self._bufferedBytes():
+                data = self.stream.read(pos - self._bufferedBytes())
+                if not data:
+                    break
+                self.buffer.append(data)
+            if pos > self._bufferedBytes():
+                raise IOError("Cannot seek past the end of the stream")
+        if not self.buffer:
+            # Nothing has ever been read; the only valid target is 0.
+            assert pos == 0
+            self.position = [-1, 0]
+            return
         offset = pos
         i = 0
         while len(self.buffer[i]) < offset:
@@ -89,10 +107,20 @@ class BufferedStream(object):
         return sum([len(item) for item in self.buffer])
 
     def _readStream(self, bytes):
-        data = self.stream.read(bytes)
-        self.buffer.append(data)
-        self.position[0] += 1
-        self.position[1] = len(data)
+        # The underlying stream is allowed to return fewer bytes than
+        # requested without being at EOF; only b"" signals EOF. Loop until
+        # the request is satisfied or EOF is reached, and never append an
+        # empty chunk to the buffer since it would corrupt chunk indices.
+        data = b""
+        while len(data) < bytes:
+            extra = self.stream.read(bytes - len(data))
+            if not extra:
+                break
+            data += extra
+        if data:
+            self.buffer.append(data)
+            self.position[0] += 1
+            self.position[1] = len(data)
         return data
 
     def _readFromBuffer(self, bytes):
@@ -120,6 +148,41 @@ class BufferedStream(object):
             rv.append(self._readStream(remainingBytes))
 
         return b"".join(rv)
+
+
+class IncrementalCharmapStreamReader(object):
+    """Stream reader backed by an incremental charmap decoder.
+
+    webencodings' custom ``x-user-defined`` and ``replacement`` codecs are
+    charmap codecs whose generated ``StreamReader`` resolves ``decode`` to
+    the stateless ``Codec.decode`` through method-resolution order, which
+    bypasses the normal codecs stream machinery and returns bytes on
+    Python 3. This thin wrapper exposes the small surface the input stream
+    relies on (``read``) and decodes incrementally so that bytes split across
+    reads are handled exactly like any other encoding.
+    """
+
+    def __init__(self, stream, codec_info, errors="strict"):
+        self.stream = stream
+        self.decoder = codec_info.incrementaldecoder(errors=errors)
+        self._eof = False
+
+    def read(self, size=-1):
+        if self._eof:
+            return ""
+        if size is None or size < 0:
+            data = self.stream.read()
+            text = self.decoder.decode(data, final=True)
+            self._eof = True
+            return text
+        # The decoder is stateless per byte for charmap encodings, but feed
+        # exactly the bytes requested and only mark final on EOF.
+        data = self.stream.read(size)
+        if data:
+            return self.decoder.decode(data, final=False)
+        text = self.decoder.decode(b"", final=True)
+        self._eof = True
+        return text
 
 
 def HTMLInputStream(source, **kwargs):
@@ -403,7 +466,12 @@ class HTMLBinaryInputStream(HTMLUnicodeInputStream):
         #              self.charEncoding as appropriate
         self.rawStream = self.openStream(source)
 
-        HTMLUnicodeInputStream.__init__(self, self.rawStream)
+        # Initialise the Unicode-stream bookkeeping without the superclass
+        # reset(): the encoding is not known yet, so resetting here would
+        # build a stream reader for the wrong codec and potentially consume
+        # bytes from the raw stream. reset() runs again below once the
+        # encoding has been determined.
+        self._initUnicodeStreamState()
 
         # Encoding Information
         # Number of bytes to use when looking for a meta element with
@@ -425,8 +493,31 @@ class HTMLBinaryInputStream(HTMLUnicodeInputStream):
         # Call superclass
         self.reset()
 
+    def _initUnicodeStreamState(self):
+        # Mirrors the state set up by HTMLUnicodeInputStream.__init__
+        # without selecting a codec or calling reset().
+        if not _utils.supports_lone_surrogates:
+            self.reportCharacterErrors = None
+        elif len("\U0010FFFF") == 1:
+            self.reportCharacterErrors = self.characterErrorsUCS4
+        else:
+            self.reportCharacterErrors = self.characterErrorsUCS2
+        self.newLines = [0]
+        self.charEncoding = (lookupEncoding("utf-8"), "certain")
+
     def reset(self):
-        self.dataStream = self.charEncoding[0].codec_info.streamreader(self.rawStream, 'replace')
+        codec_info = self.charEncoding[0].codec_info
+        if codec_info.name in ("x-user-defined", "replacement"):
+            # webencodings implements these with charmap codecs whose
+            # StreamReader MRO resolves to the stateless Codec.decode, which
+            # returns raw bytes instead of decoded text on Python 3. Use an
+            # incremental-decoder backed reader instead; see
+            # https://github.com/gsnedders/webencodings/issues/
+            self.dataStream = IncrementalCharmapStreamReader(
+                self.rawStream, codec_info, 'replace')
+        else:
+            self.dataStream = codec_info.streamreader(
+                self.rawStream, 'replace')
         HTMLUnicodeInputStream.reset(self)
 
     def openStream(self, source):
@@ -536,9 +627,19 @@ class HTMLBinaryInputStream(HTMLUnicodeInputStream):
             codecs.BOM_UTF32_LE: 'utf-32le', codecs.BOM_UTF32_BE: 'utf-32be'
         }
 
-        # Go to beginning of file and read in 4 bytes
-        string = self.rawStream.read(4)
-        assert isinstance(string, bytes)
+        # Go to beginning of file and read in 4 bytes. A read may return
+        # fewer than 4 bytes without signalling EOF, so keep reading until
+        # either 4 bytes are buffered or the stream reports EOF with b"".
+        # This continuation matters when a UTF-16/UTF-32 BOM is split
+        # across short reads: two bytes alone would otherwise be mistaken
+        # for a UTF-16 BOM before the remaining UTF-32 BOM bytes arrive.
+        string = b""
+        while len(string) < 4:
+            chunk = self.rawStream.read(4 - len(string))
+            assert isinstance(chunk, bytes)
+            if not chunk:
+                break
+            string += chunk
 
         # Try detecting the BOM using bytes from the string
         encoding = bomDict.get(string[:3])         # UTF-8

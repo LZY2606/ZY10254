@@ -32,6 +32,13 @@ html5lib Package
     :show-inheritance:
     :special-members: __init__
 
+Input handling
+--------------
+
+.. toctree::
+
+    inputstream
+
 Subpackages
 -----------
 

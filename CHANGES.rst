@@ -20,6 +20,18 @@ Bug fixes:
 
 * The sanitizer now permits ``<summary>`` tags. It used to allow ``<details>``
   already. (#423)
+* ``BufferedStream`` now handles binary sources that return fewer bytes than
+  requested on a successful (non-EOF) read. BOM detection keeps reading until
+  it has the up-to-four byte prefix or genuine EOF, so a UTF-16/UTF-32 BOM
+  split across short reads is no longer mistaken for a different encoding,
+  and seeking just past such a BOM no longer raises ``AssertionError``.
+* The binary input stream no longer builds a codec stream reader before the
+  character encoding has been determined, which previously left a second,
+  mismatched decoder wrapped around the selected one for non-default
+  encodings.
+* Streams using the webencodings ``x-user-defined`` codec now decode the
+  upper byte half to U+F780..U+F7FF instead of passing raw bytes through,
+  working around an MRO bug in webencodings' charmap ``StreamReader``.
 
 1.1
 ~~~
