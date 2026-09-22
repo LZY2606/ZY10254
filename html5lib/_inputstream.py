@@ -77,6 +77,10 @@ class BufferedStream(object):
         self.position = [i, offset]
 
     def read(self, bytes):
+        if bytes == 0:
+            # A zero-length probe must never consume or buffer data; in
+            # particular an empty return value here is not EOF.
+            return self.stream.read(0)
         if not self.buffer:
             return self._readStream(bytes)
         elif (self.position[0] == len(self.buffer) and
@@ -89,11 +93,23 @@ class BufferedStream(object):
         return sum([len(item) for item in self.buffer])
 
     def _readStream(self, bytes):
-        data = self.stream.read(bytes)
-        self.buffer.append(data)
-        self.position[0] += 1
-        self.position[1] = len(data)
-        return data
+        # A single raw read may be a short read (returning fewer bytes than
+        # requested while not at EOF). Keep reading until the request is
+        # satisfied or the underlying stream signals EOF with b"". Each
+        # fragment is buffered separately so seek(0)/reparse stays correct,
+        # and the return value is the concatenation of the new fragments.
+        fragments = []
+        remaining = bytes
+        while remaining:
+            fragment = self.stream.read(remaining)
+            self.buffer.append(fragment)
+            self.position[0] += 1
+            self.position[1] = len(fragment)
+            fragments.append(fragment)
+            if not fragment:
+                break
+            remaining -= len(fragment)
+        return b"".join(fragments)
 
     def _readFromBuffer(self, bytes):
         remainingBytes = bytes
@@ -515,10 +531,13 @@ class HTMLBinaryInputStream(HTMLUnicodeInputStream):
         newEncoding = lookupEncoding(newEncoding)
         if newEncoding is None:
             return
+        # A parser-side declaration naming UTF-16 is honoured as UTF-8; map
+        # the label before comparing so the usual reparse path rebuilds the
+        # decoder (the previously attached codec would otherwise be kept).
         if newEncoding.name in ("utf-16be", "utf-16le"):
             newEncoding = lookupEncoding("utf-8")
             assert newEncoding is not None
-        elif newEncoding == self.charEncoding[0]:
+        if newEncoding == self.charEncoding[0]:
             self.charEncoding = (self.charEncoding[0], "certain")
         else:
             self.rawStream.seek(0)

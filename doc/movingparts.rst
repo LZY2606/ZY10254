@@ -144,22 +144,84 @@ Encoding discovery
 ------------------
 
 Parsed trees are always Unicode. However a large variety of input
-encodings are supported. The encoding of the document is determined in
-the following way:
+encodings are supported. The encoding of the document is determined from
+several sources in a fixed precedence order (BOM, override, transport,
+``<meta>`` prescan, parent, likely encoding, optional chardet, and
+default), and the parser restarts decoding once if a tentative encoding
+is superseded by a ``<meta charset>`` seen after the prescan window. The
+full precedence, chunking semantics, complexity and compatibility notes
+are in the ``Input streams and encodings`` section below.
 
-* The encoding may be explicitly specified by passing the name of the
-  encoding as the encoding parameter to the
-  :meth:`~html5lib.html5parser.HTMLParser.parse` method on
-  :class:`~html5lib.html5parser.HTMLParser` objects.
+Input streams and encodings
+---------------------------
 
-* If no encoding is specified, the parser will attempt to detect the
-  encoding from a ``<meta>``  element in the first 512 bytes of the
-  document (this is only a partial implementation of the current HTML
-  specification).
+The parser accepts both text (``str``) and byte input. Byte input goes through
+:class:`~html5lib._inputstream.HTMLBinaryInputStream`, which selects an
+encoding using the precedence defined by the HTML specification:
 
-* If no encoding can be found and the :mod:`chardet` library is available, an
-  attempt will be made to sniff the encoding from the byte pattern.
+#. a BOM at the start of the document (always authoritative);
+#. the ``override_encoding`` argument;
+#. the ``transport_encoding`` argument (for example an HTTP
+   ``Content-Type`` charset);
+#. an encoding declared by a ``<meta charset>`` (or
+   ``<meta http-equiv="content-type">``) found while prescanning the first
+   1024 bytes;
+#. ``same_origin_parent_encoding`` (UTF-16 labels are skipped at this step);
+#. ``likely_encoding``;
+#. optional chardet detection (disabled by passing ``useChardet=False``);
+#. ``default_encoding``, which itself defaults to ``windows-1252``.
 
-* If all else fails, the default encoding will be used. This is usually
-  `Windows-1252 <http://en.wikipedia.org/wiki/Windows-1252>`_, which is
-  a common fallback used by Web browsers.
+Encodings declared by BOM, override, or transport are *certain*; all other
+sources are *tentative*. A tentative stream changes its encoding at most
+once: when the parser reaches a ``<meta charset>`` during tokenization it
+rewinds to the start of the byte stream, rebuilds the decoder, marks the
+encoding certain, and re-parses from the beginning. A later ``<meta>``
+cannot trigger another change. A declaration naming UTF-16 when a change
+occurs is honoured as UTF-8.
+
+Encoding *labels* are resolved through the WHATWG label table provided by
+:mod:`webencodings`: only exact table labels match after ASCII case folding
+and stripping of ASCII whitespace (tab, line feed, form feed, carriage
+return, space). Other Unicode whitespace is not stripped, and underscores,
+internal spaces, or extra punctuation do not make a label valid.
+
+Chunking semantics
+~~~~~~~~~~~~~~~~~~
+
+The decoded result is independent of how the byte source splits its reads.
+The parser distinguishes two stream shapes:
+
+* **Seekable streams** (objects whose ``seek()``/``tell()`` round-trip) may
+  be rewound directly after an encoding change.
+* **Non-seekable streams** (such as raw sockets) are wrapped in
+  :class:`~html5lib._inputstream.BufferedStream`, which retains every byte it
+  has read so the stream can still be rewound. Both shapes honour the normal
+  file-object contract: ``read(n)`` may be a *short read* returning fewer than
+  ``n`` bytes while more data remains, but only ``b""`` means EOF; ``read(0)``
+  is a non-consuming probe. ``BufferedStream`` keeps issuing reads until the
+  requested amount is available or EOF (``b""``) is reached.
+
+Invalid byte sequences for the selected encoding are replaced with U+FFFD
+using Python's incremental codec, so a multibyte sequence split across two
+reads decodes the same as one delivered in a single read.
+
+Complexity
+~~~~~~~~~~
+
+Prescanning inspects at most the first 1024 bytes (constant work for a fixed
+window), and BOM detection reads at most 4 bytes. ``BufferedStream`` stores
+every byte read (O(n) memory for n bytes) so a restart can replay it;
+re-reading already buffered data is an O(1) buffer lookup plus the bytes
+copied. The single permitted encoding restart re-tokenizes the prefix once,
+so the total tokenization work is proportional to the document length plus
+that one prefix.
+
+Compatibility
+~~~~~~~~~~~~~
+
+No public argument names or defaults change and no network, locale, clock,
+or file-system state is consulted by encoding selection. Detection stays
+local: chardet is only attempted when ``useChardet`` is true (the default)
+and installed; passing ``useChardet=False`` gives fully deterministic
+selection. The test-suite contract for chunk independence and encoding
+precedence lives in ``html5lib/tests/test_stream_chunks.py``.

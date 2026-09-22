@@ -20,6 +20,15 @@ Bug fixes:
 
 * The sanitizer now permits ``<summary>`` tags. It used to allow ``<details>``
   already. (#423)
+* ``BufferedStream`` (used for non-seekable byte sources such as sockets) now
+  keeps reading until a requested read is satisfied or the underlying stream
+  signals EOF. Previously a single short read could leave the 4-byte BOM lookahead
+  or the 1024-byte encoding prescan underfilled, so BOM detection and
+  ``<meta charset>`` prescanning could silently depend on how the source chunked
+  its data.
+* When the parser changes the encoding to UTF-8 because a ``<meta>`` declaration
+  named UTF-16, the input stream now actually rebuilds the decoder during the
+  reparse instead of keeping the previously attached codec.
 
 1.1
 ~~~
